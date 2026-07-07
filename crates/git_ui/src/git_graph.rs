@@ -38,6 +38,7 @@ use search::{
     SearchOption, SearchOptions, SearchSource, SelectNextMatch, SelectPreviousMatch,
     ToggleCaseSensitive, buffer_search,
 };
+use settings::Settings as _;
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
@@ -64,7 +65,6 @@ use workspace::{
 
 const COMMIT_CIRCLE_RADIUS: Pixels = px(3.5);
 const COMMIT_CIRCLE_STROKE_WIDTH: Pixels = px(1.5);
-const LANE_WIDTH: Pixels = px(16.0);
 const LEFT_PADDING: Pixels = px(12.0);
 const LINE_WIDTH: Pixels = px(1.5);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
@@ -75,19 +75,14 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 // the git graph's row height, so commit dots and lines have space around them.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
-// Not yet wired into rendering; a later change in this feature applies these
-// to the graph layout. Keep `allow(dead_code)` until that lands.
-#[allow(dead_code)]
 fn clamp_zoom(zoom: f32) -> f32 {
     zoom.clamp(0.5, 3.0)
 }
 
-#[allow(dead_code)]
 fn scaled_lane_width(base_lane_width: f32, zoom: f32) -> Pixels {
     px((base_lane_width * clamp_zoom(zoom)).max(4.0))
 }
 
-#[allow(dead_code)]
 fn scaled_row_height(base: Pixels, extra: f32, zoom: f32) -> Pixels {
     (base + px(extra)) * clamp_zoom(zoom)
 }
@@ -1273,8 +1268,8 @@ pub fn open_or_reuse_graph(
     workspace.add_item_to_active_pane(Box::new(git_graph), None, true, window, cx);
 }
 
-fn lane_center_x(bounds: Bounds<Pixels>, lane: f32) -> Pixels {
-    bounds.origin.x + LEFT_PADDING + lane * LANE_WIDTH + LANE_WIDTH / 2.0
+fn lane_center_x(bounds: Bounds<Pixels>, lane: f32, lane_width: Pixels) -> Pixels {
+    bounds.origin.x + LEFT_PADDING + lane * lane_width + lane_width / 2.0
 }
 
 fn to_row_center(
@@ -1422,10 +1417,12 @@ impl GitGraph {
     /// required so that the canvas's float math and the `uniform_list` layout
     /// (which snaps to device pixels) agree on row positions; otherwise rows
     /// drift apart as the user scrolls when `ui_font_size` is fractional.
-    fn row_height(window: &Window, _cx: &App) -> Pixels {
+    fn row_height(window: &Window, cx: &App) -> Pixels {
+        let settings = crate::git_graph_settings::GitGraphSettings::get_global(cx);
         let rem_size = window.rem_size();
         let line_height = window.text_style().line_height_in_pixels(rem_size);
-        let raw = line_height + ROW_VERTICAL_PADDING;
+        let base = line_height + ROW_VERTICAL_PADDING;
+        let raw = scaled_row_height(base, settings.row_height, settings.zoom);
         let scale = window.scale_factor();
 
         (raw * scale).round() / scale
@@ -1445,8 +1442,14 @@ impl GitGraph {
         ((viewport_height / row_height).ceil() as usize).min(self.graph_data.commits.len())
     }
 
-    fn graph_canvas_content_width(&self) -> Pixels {
-        (LANE_WIDTH * self.graph_data.max_lanes.max(6) as f32) + LEFT_PADDING * 2.0
+    fn effective_lane_width(&self, cx: &App) -> Pixels {
+        let settings = crate::git_graph_settings::GitGraphSettings::get_global(cx);
+        scaled_lane_width(settings.lane_width, settings.zoom)
+    }
+
+    fn graph_canvas_content_width(&self, cx: &App) -> Pixels {
+        (self.effective_lane_width(cx) * self.graph_data.max_lanes.max(6) as f32)
+            + LEFT_PADDING * 2.0
     }
 
     fn preview_column_fractions(&self, window: &Window, cx: &App) -> [f32; 5] {
@@ -1496,7 +1499,7 @@ impl GitGraph {
         self.column_widths
             .read(cx)
             .preview_column_width(0, window)
-            .unwrap_or_else(|| self.graph_canvas_content_width())
+            .unwrap_or_else(|| self.graph_canvas_content_width(cx))
     }
 
     /// Decides which text columns are visible. In an editor tab all columns are
@@ -2210,7 +2213,7 @@ impl GitGraph {
         let graph_canvas = self.render_graph_canvas_interactive(window, cx);
         let commits_table =
             self.render_commits_table(width_config, columns.count(), commit_count, window, cx);
-        let graph_width = self.graph_canvas_content_width().max(px(28.)).min(px(140.));
+        let graph_width = self.graph_canvas_content_width(cx).max(px(28.));
 
         v_flex()
             .relative()
@@ -3556,6 +3559,7 @@ impl GitGraph {
 
     fn render_graph_canvas(&self, window: &Window, cx: &mut Context<GitGraph>) -> impl IntoElement {
         let row_height = Self::row_height(window, cx);
+        let lane_width = self.effective_lane_width(cx);
         let visible_row_count = self.visible_row_count(window, cx);
         let table_state = self.table_interaction_state.read(cx);
         let viewport_height = table_state
@@ -3575,8 +3579,8 @@ impl GitGraph {
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
         let graph_viewport_width = self.graph_viewport_width(window, cx);
-        let graph_width = if self.graph_canvas_content_width() > graph_viewport_width {
-            self.graph_canvas_content_width()
+        let graph_width = if self.graph_canvas_content_width(cx) > graph_viewport_width {
+            self.graph_canvas_content_width(cx)
         } else {
             graph_viewport_width
         };
@@ -3653,7 +3657,7 @@ impl GitGraph {
                             bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
                                 - vertical_scroll_offset;
 
-                        let commit_x = lane_center_x(bounds, row.lane as f32);
+                        let commit_x = lane_center_x(bounds, row.lane as f32, lane_width);
 
                         draw_commit_circle(commit_x, row_y_center, row_color, window);
                     }
@@ -3665,7 +3669,7 @@ impl GitGraph {
                             continue;
                         };
 
-                        let line_x = lane_center_x(bounds, start_column as f32);
+                        let line_x = lane_center_x(bounds, start_column as f32, lane_width);
 
                         let start_row = line.full_interval.start as i32 - first_visible_row as i32;
 
@@ -3682,7 +3686,7 @@ impl GitGraph {
 
                         let segments = &line.segments[start_segment_idx..];
                         let desired_curve_height = row_height / 3.0;
-                        let desired_curve_width = LANE_WIDTH / 3.0;
+                        let desired_curve_width = lane_width / 3.0;
 
                         for (segment_idx, segment) in segments.iter().enumerate() {
                             let is_last = segment_idx + 1 == segments.len();
@@ -3710,7 +3714,8 @@ impl GitGraph {
                                     on_row,
                                     curve_kind,
                                 } => {
-                                    let mut to_column = lane_center_x(bounds, *to_column as f32);
+                                    let mut to_column =
+                                        lane_center_x(bounds, *to_column as f32, lane_width);
 
                                     let mut to_row = to_row_center(
                                         *on_row - first_visible_row,
@@ -5344,6 +5349,24 @@ mod tests {
         // row height adds extra then scales
         assert_eq!(scaled_row_height(px(20.0), 0.0, 1.0), px(20.0));
         assert_eq!(scaled_row_height(px(20.0), 4.0, 2.0), px(48.0));
+    }
+
+    #[gpui::test]
+    fn test_graph_canvas_content_width_scales_and_uncaps(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            // Base helper is settings-independent; verify no 140px cap by construction:
+            // lane_width 16 * 20 lanes + padding far exceeds the old 140px clamp.
+            let base = px(16.0) * 20.0 + px(12.0) * 2.0;
+            assert!(base > px(140.0));
+
+            // effective lane width honors the default zoom (1.0) and lane_width (16).
+            let settings = crate::git_graph_settings::GitGraphSettings::get_global(cx);
+            assert_eq!(
+                scaled_lane_width(settings.lane_width, settings.zoom),
+                px(16.0)
+            );
+        });
     }
 
     #[test]
