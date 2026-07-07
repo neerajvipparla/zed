@@ -11234,7 +11234,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        dock::{PanelEvent, test::TestPanel},
+        dock::{self, DockPosition, PanelEvent, test::TestPanel},
         item::{
             ItemBufferKind, ItemEvent,
             test::{TestItem, TestProjectItem},
@@ -13026,6 +13026,67 @@ mod tests {
             assert!(!pane.focus_handle(cx).is_focused(window));
             assert!(workspace.right_dock().read(cx).is_open());
             assert!(workspace.zoomed.is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_dock_pinned_state_defaults_and_persists(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // Left/Right default to unpinned (collapsed); Bottom is always pinned.
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(!workspace.left_dock().read(cx).is_pinned());
+            assert!(!workspace.right_dock().read(cx).is_pinned());
+            assert!(workspace.bottom_dock().read(cx).is_pinned());
+        });
+
+        // Pinning the left dock persists and is readable back via the same
+        // global (non-workspace-scoped) helper the next Dock::new call would use.
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_pinned(true, cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.left_dock().read(cx).is_pinned());
+            assert!(dock::load_pinned_state(DockPosition::Left, cx));
+            // Right dock is untouched.
+            assert!(!dock::load_pinned_state(DockPosition::Right, cx));
+        });
+
+        // Unpinning persists back to false.
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_pinned(false, cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        workspace.read_with(cx, |_workspace, cx| {
+            assert!(!dock::load_pinned_state(DockPosition::Left, cx));
+        });
+
+        // Bottom dock pin state is never persisted, even if set_pinned were
+        // called on it directly -- this documents the trap noted in Dock::render
+        // (Task 3): Bottom's Dock always reports is_pinned() == true regardless
+        // of what's written here, because load_pinned_state short-circuits to
+        // true for positions where dock_position_supports_pinning is false.
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace.bottom_dock().update(cx, |dock, cx| {
+                dock.set_pinned(false, cx);
+            });
+        });
+        cx.executor().run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.bottom_dock().read(cx).is_pinned());
         });
     }
 

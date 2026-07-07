@@ -277,6 +277,7 @@ pub struct Dock {
     pub(crate) serialized_dock: Option<DockData>,
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
+    pinned: bool,
     _subscriptions: [Subscription; 2],
 }
 
@@ -338,6 +339,18 @@ impl DockPosition {
             Self::Bottom => Axis::Vertical,
         }
     }
+
+    /// Stable, lowercase key used for global (non-workspace-scoped)
+    /// persistence, e.g. of pin state. Bottom is intentionally excluded
+    /// from pin persistence (see collapsible sidebar spec) but the key is
+    /// still defined here for completeness.
+    fn persistence_key(&self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Bottom => "bottom",
+            Self::Right => "right",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -359,6 +372,44 @@ pub struct PanelButtons {
 }
 
 pub(crate) const PANEL_SIZE_STATE_KEY: &str = "dock_panel_size";
+pub(crate) const DOCK_PINNED_KEY: &str = "dock_pinned";
+
+/// Bottom dock always behaves as pinned (unaffected by the collapsible
+/// sidebar feature); only Left/Right read/write persisted pin state.
+fn dock_position_supports_pinning(position: DockPosition) -> bool {
+    matches!(position, DockPosition::Left | DockPosition::Right)
+}
+
+pub(crate) fn load_pinned_state(position: DockPosition, cx: &App) -> bool {
+    if !dock_position_supports_pinning(position) {
+        return true;
+    }
+    let kvp = KeyValueStore::global(cx);
+    let scope = kvp.scoped(DOCK_PINNED_KEY);
+    scope
+        .read(position.persistence_key())
+        .log_err()
+        .flatten()
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+pub(crate) fn persist_pinned_state(position: DockPosition, pinned: bool, cx: &mut App) {
+    if !dock_position_supports_pinning(position) {
+        return;
+    }
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        let scope = kvp.scoped(DOCK_PINNED_KEY);
+        scope
+            .write(
+                position.persistence_key().to_string(),
+                if pinned { "1" } else { "0" }.to_string(),
+            )
+            .await
+    })
+    .detach_and_log_err(cx);
+}
 
 fn panel_uses_flexible_width(
     position: DockPosition,
@@ -422,6 +473,7 @@ impl Dock {
                 serialized_dock: None,
                 zoom_layer_open: false,
                 modal_layer,
+                pinned: load_pinned_state(position, cx),
             }
         });
 
@@ -475,6 +527,26 @@ impl Dock {
 
     pub fn is_open(&self) -> bool {
         self.is_open
+    }
+
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        // Bottom dock is always pinned (collapsible sidebar is Left/Right only,
+        // see the collapsible sidebar spec) -- ignore any attempt to change it,
+        // rather than relying solely on the UI never exposing a pin control for
+        // it. This keeps the invariant enforced at the API boundary.
+        if !dock_position_supports_pinning(self.position) {
+            return;
+        }
+        if pinned == self.pinned {
+            return;
+        }
+        self.pinned = pinned;
+        persist_pinned_state(self.position, pinned, cx);
+        cx.notify();
     }
 
     fn resizable(&self, cx: &App) -> bool {
