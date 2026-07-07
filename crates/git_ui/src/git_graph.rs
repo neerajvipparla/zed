@@ -88,6 +88,14 @@ fn scaled_row_height(base: Pixels, extra: f32, zoom: f32) -> Pixels {
     (base + px(extra)) * clamp_zoom(zoom)
 }
 
+fn zoom_in_step(zoom: f32) -> f32 {
+    clamp_zoom(zoom * 1.1)
+}
+
+fn zoom_out_step(zoom: f32) -> f32 {
+    clamp_zoom(zoom / 1.1)
+}
+
 struct CopiedState {
     copied_at: Option<Instant>,
 }
@@ -631,6 +639,12 @@ actions!(
         ScrollDown,
         /// Toggles the selected commit's changed files between flat and tree views.
         ToggleChangedFilesView,
+        /// Increases the git graph zoom (lane spacing and row height).
+        ZoomIn,
+        /// Decreases the git graph zoom (lane spacing and row height).
+        ZoomOut,
+        /// Resets the git graph zoom to the default.
+        ResetZoom,
     ]
 );
 
@@ -1481,6 +1495,21 @@ impl GitGraph {
         cx.update_global::<SettingsStore, _>(|store, _cx| {
             store.update_settings_file(fs, move |settings, _cx| {
                 settings.git_graph.get_or_insert_default().graph_width = width;
+            });
+        });
+    }
+
+    /// Writes the git graph zoom to `settings.json`, clamping it to the
+    /// allowed range first.
+    fn set_zoom(&self, new_zoom: f32, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let new_zoom = clamp_zoom(new_zoom);
+        cx.update_global::<SettingsStore, _>(|store, _cx| {
+            store.update_settings_file(fs, move |settings, _cx| {
+                settings.git_graph.get_or_insert_default().zoom = Some(new_zoom);
             });
         });
     }
@@ -4316,6 +4345,17 @@ impl Render for GitGraph {
             .on_action(cx.listener(|this, _: &OpenCommitView, window, cx| {
                 this.open_selected_commit_view(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
+                let current = crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom;
+                this.set_zoom(zoom_in_step(current), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| {
+                let current = crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom;
+                this.set_zoom(zoom_out_step(current), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ResetZoom, _window, cx| {
+                this.set_zoom(1.0, cx);
+            }))
             .on_action(cx.listener(Self::copy_selected_commit_sha))
             .on_action(cx.listener(Self::copy_selected_commit_tag))
             .on_action(cx.listener(Self::cancel))
@@ -5437,6 +5477,15 @@ mod tests {
         // row height adds extra then scales
         assert_eq!(scaled_row_height(px(20.0), 0.0, 1.0), px(20.0));
         assert_eq!(scaled_row_height(px(20.0), 4.0, 2.0), px(48.0));
+    }
+
+    #[test]
+    fn test_zoom_steps() {
+        // step is 1.1, clamped to [0.5, 3.0]
+        assert!((zoom_in_step(1.0) - 1.1).abs() < 1e-6);
+        assert!((zoom_out_step(1.1) - 1.0).abs() < 1e-6);
+        assert_eq!(zoom_in_step(3.0), 3.0); // clamps at max
+        assert_eq!(zoom_out_step(0.5), 0.5); // clamps at min
     }
 
     #[gpui::test]
