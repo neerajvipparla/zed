@@ -136,6 +136,7 @@ pub struct SettingsContent {
     pub file_finder: Option<FileFinderSettingsContent>,
 
     pub git_panel: Option<GitPanelSettingsContent>,
+    pub git_graph: Option<GitGraphSettingsContent>,
 
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
@@ -720,6 +721,36 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: project_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct GitGraphSettingsContent {
+    /// Base horizontal spacing between graph lanes, in pixels.
+    ///
+    /// Default: 16.0
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub lane_width: Option<f32>,
+
+    /// Extra height added to each commit row, in pixels. 0 keeps the
+    /// font-derived row height.
+    ///
+    /// Default: 0.0
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub row_height: Option<f32>,
+
+    /// Combined zoom multiplier applied to lane width and row height.
+    ///
+    /// Default: 1.0
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub zoom: Option<f32>,
+
+    /// Width of the graph lane area in the sidebar panel, in pixels.
+    /// Unset means the width is computed automatically from the graph.
+    ///
+    /// Default: unset
+    #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
+    pub graph_width: Option<f32>,
 }
 
 #[derive(

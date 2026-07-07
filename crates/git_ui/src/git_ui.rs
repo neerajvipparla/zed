@@ -46,6 +46,7 @@ mod conflict_view;
 pub mod created_worktrees;
 pub mod file_diff_view;
 pub mod git_graph;
+mod git_graph_settings;
 pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;

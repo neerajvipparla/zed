@@ -75,6 +75,23 @@ const CUSTOM_GIT_COMMANDS_DOCS_SLUG: &str = "tasks#custom-git-commands";
 // the git graph's row height, so commit dots and lines have space around them.
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
+// Not yet wired into rendering; a later change in this feature applies these
+// to the graph layout. Keep `allow(dead_code)` until that lands.
+#[allow(dead_code)]
+fn clamp_zoom(zoom: f32) -> f32 {
+    zoom.clamp(0.5, 3.0)
+}
+
+#[allow(dead_code)]
+fn scaled_lane_width(base_lane_width: f32, zoom: f32) -> Pixels {
+    px((base_lane_width * clamp_zoom(zoom)).max(4.0))
+}
+
+#[allow(dead_code)]
+fn scaled_row_height(base: Pixels, extra: f32, zoom: f32) -> Pixels {
+    (base + px(extra)) * clamp_zoom(zoom)
+}
+
 struct CopiedState {
     copied_at: Option<Instant>,
 }
@@ -5310,6 +5327,23 @@ mod tests {
         if let Err(error) = verify_all_invariants(&graph_data, &commits) {
             panic!("Graph invariant violation for merge commits:\n{}", error);
         }
+    }
+
+    #[test]
+    fn test_scaling_helpers() {
+        // zoom clamps to [0.5, 3.0]
+        assert_eq!(clamp_zoom(0.1), 0.5);
+        assert_eq!(clamp_zoom(10.0), 3.0);
+        assert_eq!(clamp_zoom(1.0), 1.0);
+
+        // lane width scales with zoom and floors at 4px
+        assert_eq!(scaled_lane_width(16.0, 1.0), px(16.0));
+        assert_eq!(scaled_lane_width(16.0, 2.0), px(32.0));
+        assert_eq!(scaled_lane_width(1.0, 0.5), px(4.0)); // floored
+
+        // row height adds extra then scales
+        assert_eq!(scaled_row_height(px(20.0), 0.0, 1.0), px(20.0));
+        assert_eq!(scaled_row_height(px(20.0), 4.0, 2.0), px(48.0));
     }
 
     #[test]
