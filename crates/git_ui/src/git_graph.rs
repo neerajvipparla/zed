@@ -39,6 +39,7 @@ use search::{
     ToggleCaseSensitive, buffer_search,
 };
 use settings::Settings as _;
+use settings::SettingsStore;
 use smallvec::{SmallVec, smallvec};
 use std::{
     cell::Cell,
@@ -108,6 +109,8 @@ impl CopiedState {
 }
 
 struct DraggedSplitHandle;
+
+struct DraggedGraphDivider;
 
 struct CommitTagPicker {
     picker: Entity<Picker<CommitTagPickerDelegate>>,
@@ -1393,6 +1396,7 @@ pub struct GitGraph {
     selected_commit_diff_stats: Option<(usize, usize)>,
     _commit_diff_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
+    graph_width_override: Option<Pixels>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
@@ -1450,6 +1454,35 @@ impl GitGraph {
     fn graph_canvas_content_width(&self, cx: &App) -> Pixels {
         (self.effective_lane_width(cx) * self.graph_data.max_lanes.max(6) as f32)
             + LEFT_PADDING * 2.0
+    }
+
+    /// Resolves the graph area's width for the sidebar panel layout, in
+    /// order of precedence: an in-progress/just-finished drag override, the
+    /// persisted setting, then the auto content width. Always floored so the
+    /// divider can't be dragged to zero.
+    fn resolve_graph_area_width(&self, cx: &App) -> Pixels {
+        let setting = crate::git_graph_settings::GitGraphSettings::get_global(cx)
+            .graph_width
+            .map(px);
+        self.graph_width_override
+            .or(setting)
+            .unwrap_or_else(|| self.graph_canvas_content_width(cx))
+            .max(px(28.))
+    }
+
+    /// Writes the graph area width to `settings.json`, or clears it when
+    /// `width` is `None` so the panel reverts to the auto content width.
+    fn persist_graph_width(&self, width: Option<Pixels>, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let fs = workspace.read(cx).app_state().fs.clone();
+        let width = width.map(|w| w.as_f32());
+        cx.update_global::<SettingsStore, _>(|store, _cx| {
+            store.update_settings_file(fs, move |settings, _cx| {
+                settings.git_graph.get_or_insert_default().graph_width = width;
+            });
+        });
     }
 
     fn preview_column_fractions(&self, window: &Window, cx: &App) -> [f32; 5] {
@@ -1668,6 +1701,7 @@ impl GitGraph {
             log_source,
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
+            graph_width_override: None,
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
@@ -2213,7 +2247,7 @@ impl GitGraph {
         let graph_canvas = self.render_graph_canvas_interactive(window, cx);
         let commits_table =
             self.render_commits_table(width_config, columns.count(), commit_count, window, cx);
-        let graph_width = self.graph_canvas_content_width(cx).max(px(28.));
+        let graph_width = self.resolve_graph_area_width(cx);
 
         v_flex()
             .relative()
@@ -2225,12 +2259,14 @@ impl GitGraph {
                     .when(!is_path_history, |this| {
                         this.child(
                             div()
+                                .id("git-graph-panel-area")
                                 .w(graph_width)
                                 .h_full()
                                 .min_w_0()
-                                .overflow_hidden()
+                                .overflow_x_scroll()
                                 .child(graph_canvas),
                         )
+                        .child(self.render_graph_divider_handle(cx))
                     })
                     .child(
                         div()
@@ -4045,6 +4081,58 @@ impl GitGraph {
             )
             .into_any_element()
     }
+
+    /// Draggable divider between the graph lane area and the commit-message
+    /// table in the sidebar panel layout. Dragging updates the in-memory
+    /// override immediately for live feedback; dropping persists the width
+    /// to `settings.json`. Double-clicking resets to the auto content width.
+    fn render_graph_divider_handle(&self, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("graph-divider-resize-container")
+            .relative()
+            .h_full()
+            .flex_shrink_0()
+            .w(px(1.))
+            .bg(cx.theme().colors().border_variant)
+            .child(
+                div()
+                    .id("graph-divider-resize-handle")
+                    .absolute()
+                    .left(px(-RESIZE_HANDLE_WIDTH / 2.0))
+                    .w(px(RESIZE_HANDLE_WIDTH))
+                    .h_full()
+                    .cursor_col_resize()
+                    .block_mouse_except_scroll()
+                    .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                        if event.click_count() >= 2 {
+                            this.graph_width_override = None;
+                            this.persist_graph_width(None, cx);
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedGraphDivider, |_, _, _, cx| cx.new(|_| gpui::Empty))
+                    .on_drag_move::<DraggedGraphDivider>(cx.listener(
+                        |this, event: &DragMoveEvent<DraggedGraphDivider>, _window, cx| {
+                            // `event.bounds` is the handle's own hitbox, which moves as
+                            // the graph area is resized, so measure from the graph
+                            // canvas's stable left edge instead.
+                            let origin_x = this
+                                .graph_canvas_bounds
+                                .get()
+                                .map(|bounds| bounds.origin.x)
+                                .unwrap_or(event.bounds.left());
+                            let new_width = (event.event.position.x - origin_x).max(px(28.));
+                            this.graph_width_override = Some(new_width);
+                            cx.notify();
+                        },
+                    ))
+                    .on_drop::<DraggedGraphDivider>(cx.listener(|this, _event, _window, cx| {
+                        this.persist_graph_width(this.graph_width_override, cx);
+                    })),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for GitGraph {
@@ -5367,6 +5455,84 @@ mod tests {
                 px(16.0)
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_resolve_graph_area_width(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Both override and setting are None: falls back to the auto content width.
+        let auto_width =
+            git_graph.read_with(&*cx, |graph, cx| graph.graph_canvas_content_width(cx));
+        let resolved =
+            git_graph.read_with(&*cx, |graph, cx| graph.resolve_graph_area_width(cx));
+        assert_eq!(resolved, auto_width.max(px(28.)));
+
+        // Setting wins over auto when there is no in-memory override.
+        cx.update(|_window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_graph.get_or_insert_default().graph_width = Some(80.0);
+                });
+            });
+        });
+        let resolved =
+            git_graph.read_with(&*cx, |graph, cx| graph.resolve_graph_area_width(cx));
+        assert_eq!(resolved, px(80.0));
+
+        // In-memory override wins over the persisted setting.
+        git_graph.update(cx, |graph, _| {
+            graph.graph_width_override = Some(px(200.0));
+        });
+        let resolved =
+            git_graph.read_with(&*cx, |graph, cx| graph.resolve_graph_area_width(cx));
+        assert_eq!(resolved, px(200.0));
+
+        // The 28px floor applies even to an explicit override.
+        git_graph.update(cx, |graph, _| {
+            graph.graph_width_override = Some(px(10.0));
+        });
+        let resolved =
+            git_graph.read_with(&*cx, |graph, cx| graph.resolve_graph_area_width(cx));
+        assert_eq!(resolved, px(28.0));
     }
 
     #[test]
