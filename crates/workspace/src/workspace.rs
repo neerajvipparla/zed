@@ -7975,6 +7975,32 @@ impl Workspace {
             )
     }
 
+    /// Returns the width that should be reserved for `position`'s dock in the
+    /// horizontal flex layout, or `None` if the dock should reserve no space
+    /// (an unpinned Left/Right dock with an active panel — it renders as a
+    /// hover-triggered floating overlay instead; see `Dock::render`).
+    ///
+    /// Bottom dock always reserves space when open (out of scope for the
+    /// collapsible sidebar feature).
+    fn reserved_dock_width(
+        &self,
+        position: DockPosition,
+        window: &Window,
+        cx: &App,
+    ) -> Option<Pixels> {
+        let dock = self.dock_at_position(position).read(cx);
+        let panel = dock.visible_panel()?;
+        if position.axis() == Axis::Horizontal && !dock.is_pinned() {
+            return None;
+        }
+        let size_state = dock.stored_panel_size_state(panel.as_ref());
+        Some(
+            size_state
+                .and_then(|state| state.size)
+                .unwrap_or_else(|| panel.default_size(window, cx)),
+        )
+    }
+
     fn render_dock(
         &self,
         position: DockPosition,
@@ -8002,14 +8028,14 @@ impl Workspace {
         // Apply sizing only when the dock is open. When closed the dock is still
         // included in the element tree so its focus handle remains mounted — without
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
-        let dock = dock.read(cx);
-        if let Some(panel) = dock.visible_panel() {
-            let size_state = dock.stored_panel_size_state(panel.as_ref());
+        let dock_ref = dock.read(cx);
+        if let Some(panel) = dock_ref.visible_panel() {
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
                 let use_flexible = panel.has_flexible_size(window, cx);
-                let flex_grow = if use_flexible {
-                    size_state
+                let flex_grow = if use_flexible && dock_ref.is_pinned() {
+                    dock_ref
+                        .stored_panel_size_state(panel.as_ref())
                         .and_then(|state| state.flex)
                         .or_else(|| self.default_dock_flex(position))
                 } else {
@@ -8021,10 +8047,7 @@ impl Workspace {
                     style.flex_grow = Some(grow);
                     style.flex_shrink = Some(1.0);
                     style.flex_basis = Some(relative(0.).into());
-                } else {
-                    let size = size_state
-                        .and_then(|state| state.size)
-                        .unwrap_or_else(|| panel.default_size(window, cx));
+                } else if let Some(size) = self.reserved_dock_width(position, window, cx) {
                     container = container.w(size);
                     // Allow the fixed-width dock to shrink when there isn't
                     // enough space (e.g. when the sidebar is open). The
@@ -8032,14 +8055,17 @@ impl Workspace {
                     // when space becomes available.
                     let style = container.style();
                     style.flex_shrink = Some(1.0);
+                } else {
+                    // Unpinned: reserve no width. The panel renders as a
+                    // floating overlay from Dock::render instead (see Task 3).
+                    container = container.w(px(0.));
                 }
-                if let Some(min) = min_size {
+                if let Some(min) = min_size
+                    && dock_ref.is_pinned()
+                {
                     container = container.min_w(min);
                 }
-            } else {
-                let size = size_state
-                    .and_then(|state| state.size)
-                    .unwrap_or_else(|| panel.default_size(window, cx));
+            } else if let Some(size) = self.reserved_dock_width(position, window, cx) {
                 container = container.h(size);
             }
         }
@@ -13087,6 +13113,50 @@ mod tests {
 
         workspace.read_with(cx, |workspace, cx| {
             assert!(workspace.bottom_dock().read(cx).is_pinned());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_unpinned_left_right_docks_report_no_reserved_width(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(left_panel.clone(), window, cx);
+            // `toggle_dock` both opens the dock and activates a panel so
+            // `visible_panel()` returns `Some` -- a bare `set_open(true)`
+            // leaves `active_panel_index` unset since `TestPanel` doesn't
+            // start open.
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+        });
+
+        // Newly created docks default to unpinned (Task 1) -- render_dock must
+        // report no reserved width for the left dock in this state.
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.left_dock().read(cx).is_pinned());
+            assert!(workspace.left_dock().read(cx).is_open());
+            assert_eq!(
+                workspace.reserved_dock_width(DockPosition::Left, window, cx),
+                None
+            );
+        });
+
+        // Pinning restores the normal reserved-width behavior.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.set_pinned(true, cx));
+            assert!(
+                workspace
+                    .reserved_dock_width(DockPosition::Left, window, cx)
+                    .is_some()
+            );
         });
     }
 
