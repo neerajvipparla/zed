@@ -13128,7 +13128,7 @@ mod tests {
 
         workspace.update_in(cx, |workspace, window, cx| {
             let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
-            workspace.add_panel(left_panel.clone(), window, cx);
+            workspace.add_panel(left_panel, window, cx);
             // `toggle_dock` both opens the dock and activates a panel so
             // `visible_panel()` returns `Some` -- a bare `set_open(true)`
             // leaves `active_panel_index` unset since `TestPanel` doesn't
