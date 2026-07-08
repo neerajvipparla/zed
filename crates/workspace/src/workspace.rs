@@ -11268,8 +11268,8 @@ mod tests {
     };
     use fs::FakeFs;
     use gpui::{
-        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, Render, TestAppContext,
-        UpdateGlobal, VisualTestContext, px,
+        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, Modifiers, Render,
+        TestAppContext, UpdateGlobal, VisualTestContext, px,
     };
     use project::{Project, ProjectEntryId, WorktreeId};
     use serde_json::json;
@@ -13209,6 +13209,85 @@ mod tests {
         });
         workspace.read_with(cx, |workspace, cx| {
             assert!(workspace.bottom_dock().read(cx).is_peeking());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_hover_status_bar_icon_peeks_unpinned_dock(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // `TestPanel::icon()` returns `None` by default, which means
+        // `PanelButtons` (`dock.rs:1487`, `entry.panel.icon(window, cx)?`)
+        // skips rendering a status bar button for it entirely -- there'd be
+        // nothing to hover. `with_icon` opts this panel into a real icon so
+        // its button (and the icon's `debug_selector`, set unconditionally
+        // by `IconButton::new`, see `icon_button.rs:47`) actually renders.
+        workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| {
+                TestPanel::new(DockPosition::Left, 100, cx).with_icon(IconName::Folder)
+            });
+            workspace.add_panel(panel, window, cx);
+        });
+        cx.run_until_parked();
+
+        // Left dock starts unpinned (Task 1) and not peeking (Task 3) --
+        // hovering hasn't happened yet.
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.left_dock().read(cx).is_pinned());
+            assert!(!workspace.left_dock().read(cx).is_peeking());
+        });
+
+        let icon_bounds = cx
+            .debug_bounds("ICON-Folder")
+            .expect("panel status bar icon with a real icon should be rendered");
+
+        // Hovering the status bar icon should activate + open + peek the
+        // dock (Task 4's `on_hover` wiring, `dock.rs:1642`).
+        cx.simulate_mouse_move(icon_bounds.center(), None, Modifiers::default());
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.left_dock().read(cx).is_peeking(),
+                "hovering an unpinned dock's status bar icon should start peeking"
+            );
+        });
+
+        // Empirically test the icon -> overlay hand-off flagged as a
+        // theoretical race in the Task 4 report: move directly from the
+        // icon onto the peek overlay with no intervening mouse position in
+        // between (a single `simulate_mouse_move` call, matching how a real
+        // adjacent-hitbox crossing delivers exactly one `MouseMoveEvent`),
+        // and confirm peeking survives the hand-off instead of flickering
+        // closed. The overlay's own `on_hover` (Task 3, `dock.rs:1444`) only
+        // reacts to its `false` (mouse-leave) case, so this is exercising
+        // whether that's sufficient on its own.
+        let overlay_bounds = cx
+            .debug_bounds("dock-peek-overlay")
+            .expect("peek overlay should be rendered while peeking");
+        cx.simulate_mouse_move(overlay_bounds.center(), None, Modifiers::default());
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.left_dock().read(cx).is_peeking(),
+                "moving from the icon directly onto the peek overlay (no gap) should keep peeking, not flicker-close"
+            );
+        });
+
+        // Moving away from both the icon and the overlay ends peeking.
+        cx.simulate_mouse_move(gpui::point(px(-1000.), px(-1000.)), None, Modifiers::default());
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                !workspace.left_dock().read(cx).is_peeking(),
+                "moving away from the icon and the overlay should stop peeking"
+            );
         });
     }
 

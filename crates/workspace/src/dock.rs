@@ -279,6 +279,17 @@ pub struct Dock {
     modal_layer: Entity<ModalLayer>,
     pinned: bool,
     peeking: bool,
+    // Tracked separately from `peeking` (and OR'd together, see
+    // `set_icon_hovered`/`set_overlay_hovered`) because GPUI dispatches every
+    // hover listener for a single `MouseMoveEvent` independently: when the
+    // cursor crosses directly from the status bar icon's hitbox into the
+    // adjacent, deferred peek overlay's hitbox with no gap, the icon's
+    // hover-end and the overlay's hover-start fire in the very same event
+    // dispatch. If either handler wrote straight to `peeking`, whichever one
+    // happens to run last in that dispatch would win and could stomp the
+    // other's update -- closing the overlay right as the cursor lands on it.
+    icon_hovered: bool,
+    overlay_hovered: bool,
     _subscriptions: [Subscription; 2],
 }
 
@@ -476,6 +487,8 @@ impl Dock {
                 modal_layer,
                 pinned: load_pinned_state(position, cx),
                 peeking: false,
+                icon_hovered: false,
+                overlay_hovered: false,
             }
         });
 
@@ -564,6 +577,28 @@ impl Dock {
         }
         self.peeking = peeking;
         cx.notify();
+    }
+
+    /// Marks whether the panel's status bar icon is currently hovered, and
+    /// recomputes `peeking` as `icon_hovered || overlay_hovered`.
+    ///
+    /// Called from the status bar icon's own `on_hover` (`impl Render for
+    /// PanelButtons`) instead of calling `set_peeking` directly -- see the
+    /// comment on the `icon_hovered`/`overlay_hovered` fields for why a plain
+    /// `set_peeking(false, cx)` on hover-end is not safe here: the peek
+    /// overlay's own hover-start can fire in the very same event dispatch
+    /// and would otherwise be clobbered by this handler running afterward.
+    pub fn set_icon_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.icon_hovered = hovered;
+        self.set_peeking(self.icon_hovered || self.overlay_hovered, cx);
+    }
+
+    /// Marks whether the peek overlay itself is currently hovered. See
+    /// `set_icon_hovered` for why this is tracked independently rather than
+    /// setting `peeking` directly.
+    pub fn set_overlay_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.overlay_hovered = hovered;
+        self.set_peeking(self.icon_hovered || self.overlay_hovered, cx);
     }
 
     fn resizable(&self, cx: &App) -> bool {
@@ -1427,6 +1462,11 @@ impl Render for Dock {
                 anchored().anchor(anchor).child(
                     div()
                         .id("dock-peek-overlay")
+                        // Lets tests locate the overlay's painted bounds via
+                        // `VisualTestContext::debug_bounds` (a no-op outside
+                        // test/test-support builds) to simulate hovering
+                        // directly from the status bar icon onto the overlay.
+                        .debug_selector(|| "dock-peek-overlay".into())
                         .occlude()
                         .relative()
                         .w(overlay_width)
@@ -1441,10 +1481,16 @@ impl Render for Dock {
                             DockPosition::Right => this.border_l_1(),
                             DockPosition::Bottom => this.border_t_1(),
                         })
+                        // Tracks its own hover state independently rather than
+                        // calling `set_peeking` directly -- see the comment on
+                        // `Dock::icon_hovered`/`overlay_hovered` and
+                        // `set_overlay_hovered` for why: when the cursor
+                        // crosses directly from the status bar icon onto this
+                        // overlay with no gap, this hover-start and the icon's
+                        // hover-end land in the same event dispatch, and
+                        // whichever wrote `peeking` last would otherwise win.
                         .on_hover(cx.listener(move |dock, hovered, _window, cx| {
-                            if !hovered {
-                                dock.set_peeking(false, cx);
-                            }
+                            dock.set_overlay_hovered(*hovered, cx);
                         }))
                         .child(panel_content())
                         .children(pin_button),
@@ -1650,12 +1696,12 @@ impl Render for PanelButtons {
                                                 dock.activate_panel(panel_index, window, cx);
                                             }
                                             dock.set_open(true, window, cx);
-                                            dock.set_peeking(true, cx);
+                                            dock.set_icon_hovered(true, cx);
                                         });
                                     } else {
                                         dock_for_hover.update(cx, |dock, cx| {
                                             if !dock.is_pinned() {
-                                                dock.set_peeking(false, cx);
+                                                dock.set_icon_hovered(false, cx);
                                             }
                                         });
                                     }
@@ -1716,6 +1762,7 @@ pub mod test {
         pub default_size: Pixels,
         pub flexible: bool,
         pub activation_priority: u32,
+        pub icon: Option<ui::IconName>,
     }
     actions!(test_only, [ToggleTestPanel]);
 
@@ -1731,6 +1778,7 @@ pub mod test {
                 default_size: px(300.),
                 flexible: false,
                 activation_priority,
+                icon: None,
             }
         }
 
@@ -1743,6 +1791,17 @@ pub mod test {
                 flexible: true,
                 ..Self::new(position, activation_priority, cx)
             }
+        }
+
+        /// Opts this test panel into rendering a real status bar icon button
+        /// (`PanelButtons` skips panels whose `icon()` returns `None`, see
+        /// `dock.rs:1487`), so tests can locate and hover it via
+        /// `cx.debug_bounds("ICON-<name>")` the same way production panels'
+        /// icons are discoverable. Defaults to `None` for every other
+        /// existing test so this is purely additive/opt-in.
+        pub fn with_icon(mut self, icon: ui::IconName) -> Self {
+            self.icon = Some(icon);
+            self
         }
     }
 
@@ -1803,11 +1862,11 @@ pub mod test {
         }
 
         fn icon(&self, _window: &Window, _: &App) -> Option<ui::IconName> {
-            None
+            self.icon
         }
 
         fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
-            None
+            self.icon.map(|_| "Test Panel")
         }
 
         fn toggle_action(&self) -> Box<dyn Action> {
