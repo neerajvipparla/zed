@@ -1498,6 +1498,8 @@ impl Render for PanelButtons {
                 let currently_flexible = panel.has_flexible_size(window, cx);
                 let dock_for_menu = dock_entity.clone();
                 let workspace_for_menu = workspace.clone();
+                let dock_for_hover = dock_entity.clone();
+                let panel_index = i;
 
                 let is_active_button = Some(i) == active_index && is_open;
                 let (action, tooltip) = if is_active_button {
@@ -1627,13 +1629,37 @@ impl Render for PanelButtons {
                                     })
                                 });
 
-                            div().relative().child(button).when_some(
-                                icon_label
-                                    .clone()
-                                    .filter(|_| !is_active_button)
-                                    .and_then(|label| label.parse::<usize>().ok()),
-                                |this, count| this.child(CountBadge::new(count)),
-                            )
+                            div()
+                                .id(("panel-button", i))
+                                .relative()
+                                .child(button)
+                                .when_some(
+                                    icon_label
+                                        .clone()
+                                        .filter(|_| !is_active_button)
+                                        .and_then(|label| label.parse::<usize>().ok()),
+                                    |this, count| this.child(CountBadge::new(count)),
+                                )
+                                .on_hover(move |hovered, window, cx| {
+                                    if *hovered {
+                                        dock_for_hover.update(cx, |dock, cx| {
+                                            if dock.is_pinned() {
+                                                return;
+                                            }
+                                            if Some(panel_index) != dock.active_panel_index() {
+                                                dock.activate_panel(panel_index, window, cx);
+                                            }
+                                            dock.set_open(true, window, cx);
+                                            dock.set_peeking(true, cx);
+                                        });
+                                    } else {
+                                        dock_for_hover.update(cx, |dock, cx| {
+                                            if !dock.is_pinned() {
+                                                dock.set_peeking(false, cx);
+                                            }
+                                        });
+                                    }
+                                })
                         }),
                 )
             })
