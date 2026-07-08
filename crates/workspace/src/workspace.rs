@@ -8597,6 +8597,14 @@ fn adjust_active_dock_size_by_px(
         return;
     };
     let dock = active_dock.read(cx);
+    // An unpinned Left/Right dock's peek overlay renders without a resize
+    // handle (see `Dock::render`) -- resizing is a pinned/docked-only
+    // affordance, so a keyboard shortcut shouldn't silently write a new
+    // stored size for a dock that isn't showing the user any way to resize
+    // it. Bottom is always pinned, so this is a no-op for it.
+    if !dock.is_pinned() {
+        return;
+    }
     let Some(panel_size) = workspace.dock_size(&dock, window, cx) else {
         return;
     };
@@ -8614,7 +8622,10 @@ fn adjust_open_docks_size_by_px(
         .into_iter()
         .filter_map(|dock_entity| {
             let dock = dock_entity.read(cx);
-            if dock.is_open() {
+            // See the comment in `adjust_active_dock_size_by_px` -- only
+            // pinned (or Bottom, always pinned) docks expose a resize
+            // handle at all, so only they should be resized here.
+            if dock.is_open() && dock.is_pinned() {
                 let dock_pos = dock.position();
                 let panel_size = workspace.dock_size(&dock, window, cx)?;
                 Some((dock_pos, panel_size + px))
@@ -13255,6 +13266,10 @@ mod tests {
                 workspace.left_dock().read(cx).is_peeking(),
                 "hovering an unpinned dock's status bar icon should start peeking"
             );
+            assert!(
+                workspace.left_dock().read(cx).is_open(),
+                "peeking dock must report is_open so visible_entry()/visible_panel() find the panel to render"
+            );
         });
 
         // Empirically test the icon -> overlay hand-off flagged as a
@@ -13287,6 +13302,146 @@ mod tests {
             assert!(
                 !workspace.left_dock().read(cx).is_peeking(),
                 "moving away from the icon and the overlay should stop peeking"
+            );
+            // Regression test for the "peeking leaves is_open stuck true"
+            // finding: since the panel never held focus in this test,
+            // ending the peek must close is_open back down, so
+            // PanelButtons' active-icon highlight/tooltip and any
+            // serialized workspace state don't keep reporting the dock as
+            // open once nothing is showing it.
+            assert!(
+                !workspace.left_dock().read(cx).is_open(),
+                "ending an unfocused peek should close is_open, not leave it stuck true"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_peek_end_keeps_dock_open_while_panel_focused(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        // Drive the same state transitions `PanelButtons`' hover-start
+        // handler performs, without needing a real status bar icon.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+                dock.set_icon_hovered(true, window, cx);
+            });
+        });
+
+        // The panel gains keyboard focus while peeking (e.g. the user
+        // clicked into it, or focus followed some other interaction).
+        panel.update_in(cx, |_panel, window, cx| {
+            cx.focus_self(window);
+        });
+
+        workspace.update_in(cx, |_workspace, window, cx| {
+            assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        // Ending the hover must NOT close the dock, because the panel still
+        // holds focus -- this is the exact scenario the "is_open stuck
+        // true" fix has to avoid regressing (see `Dock::render`'s
+        // `panel_focused` check and its `on_focus_lost` comment).
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_icon_hovered(false, window, cx);
+            });
+        });
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(!workspace.left_dock().read(cx).is_peeking());
+            assert!(
+                workspace.left_dock().read(cx).is_open(),
+                "is_open must stay true while the panel holds focus, even after the peek ends"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_pin_after_peek_then_unpin_round_trip(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let left_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            workspace.add_panel(left_panel, window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+        });
+
+        // Starts unpinned/collapsed: no reserved width, hover-to-peek is the
+        // only way to see the panel.
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.left_dock().read(cx).is_pinned());
+            assert_eq!(
+                workspace.reserved_dock_width(DockPosition::Left, window, cx),
+                None
+            );
+        });
+
+        // Hover to peek (state-level, mirroring `PanelButtons`' on_hover
+        // wiring).
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_icon_hovered(true, window, cx);
+            });
+        });
+        workspace.update_in(cx, |workspace, _window, cx| {
+            assert!(workspace.left_dock().read(cx).is_peeking());
+        });
+
+        // Pinning while peeking should dock it permanently: reserved width
+        // becomes `Some`, matching the design spec's pin-while-peeking flow.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_pinned(true, cx);
+            });
+            assert!(
+                workspace
+                    .reserved_dock_width(DockPosition::Left, window, cx)
+                    .is_some(),
+                "pinning should reserve width even though it happened mid-peek"
+            );
+        });
+
+        // Ending the hover no longer matters once pinned -- the dock stays
+        // open and docked regardless of hover state.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_icon_hovered(false, window, cx);
+            });
+            assert!(workspace.left_dock().read(cx).is_open());
+            assert!(
+                workspace
+                    .reserved_dock_width(DockPosition::Left, window, cx)
+                    .is_some()
+            );
+        });
+
+        // Unpinning returns the dock to the collapsed state.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.set_pinned(false, cx);
+            });
+            assert!(
+                workspace
+                    .reserved_dock_width(DockPosition::Left, window, cx)
+                    .is_none(),
+                "unpinning should free the reserved width again"
             );
         });
     }

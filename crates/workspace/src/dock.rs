@@ -571,6 +571,14 @@ impl Dock {
         self.peeking
     }
 
+    /// Directly sets `peeking`. This remains a valid API for non-hover
+    /// callers (e.g. tests, or future programmatic triggers), but hover
+    /// sources specifically must go through `set_icon_hovered`/
+    /// `set_overlay_hovered` instead of calling this directly -- those two
+    /// OR their two underlying hover flags together before delegating here,
+    /// which avoids a dispatch-order race between the status bar icon and
+    /// the peek overlay (see the comment on the `icon_hovered`/
+    /// `overlay_hovered` fields).
     pub fn set_peeking(&mut self, peeking: bool, cx: &mut Context<Self>) {
         if peeking == self.peeking {
             return;
@@ -588,17 +596,71 @@ impl Dock {
     /// `set_peeking(false, cx)` on hover-end is not safe here: the peek
     /// overlay's own hover-start can fire in the very same event dispatch
     /// and would otherwise be clobbered by this handler running afterward.
-    pub fn set_icon_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+    pub fn set_icon_hovered(&mut self, hovered: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.icon_hovered = hovered;
-        self.set_peeking(self.icon_hovered || self.overlay_hovered, cx);
+        self.update_peeking_from_hover(window, cx);
     }
 
     /// Marks whether the peek overlay itself is currently hovered. See
     /// `set_icon_hovered` for why this is tracked independently rather than
     /// setting `peeking` directly.
-    pub fn set_overlay_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+    pub fn set_overlay_hovered(&mut self, hovered: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay_hovered = hovered;
-        self.set_peeking(self.icon_hovered || self.overlay_hovered, cx);
+        self.update_peeking_from_hover(window, cx);
+    }
+
+    /// Recomputes `peeking` from the two hover flags and, when the peek has
+    /// just ended, closes an unpinned Left/Right dock's `is_open` if nothing
+    /// else justifies it staying open.
+    ///
+    /// Without this, `is_open` -- set `true` by the hover-start handler in
+    /// `PanelButtons` so `visible_entry()`/`visible_panel()` return `Some`
+    /// while peeking -- would stay stuck `true` forever once hovering ends,
+    /// since nothing else ever clears it. That's mostly latent (the overlay
+    /// itself still correctly stops painting once `peeking` and panel focus
+    /// are both false, because `Render for Dock`'s unpinned branch checks
+    /// those, not `is_open`, before deciding whether to paint), but it does
+    /// leak into: (a) `PanelButtons`' `is_active_button` computation, which
+    /// factors in `is_open` and would keep highlighting the icon and
+    /// offering a "Close ... Dock" tooltip/action for a dock nothing is
+    /// showing; and (b) serialized workspace state, since `is_open` is
+    /// persisted.
+    ///
+    /// We only close `is_open` when the panel does **not** currently hold
+    /// keyboard focus -- mirroring the `panel_focused` check in `Render for
+    /// Dock`'s unpinned branch, which keeps the panel mounted via the
+    /// overlay specifically to dodge a focus-desync bug with
+    /// `on_focus_lost` (see that comment). If we closed `is_open`
+    /// unconditionally here, focusing the panel and then moving the mouse
+    /// away would make `visible_entry()` return `None` on the next render,
+    /// reintroducing that exact bug.
+    ///
+    /// Known limitation: if the panel holds focus when the peek ends, we
+    /// deliberately leave `is_open` at `true` (matching the case above), and
+    /// there is no observer here that reacts if focus *later* moves away
+    /// without another hover/toggle event happening -- `is_open` can remain
+    /// stuck `true` in that follow-on case (though the overlay itself still
+    /// disappears correctly, since `Render for Dock` recomputes panel focus
+    /// fresh on every render independent of `is_open`). Closing that gap
+    /// fully would require an `on_blur` subscription per active panel
+    /// wired up alongside the existing per-panel subscriptions in
+    /// `add_panel`, kept in sync as `active_panel_index` changes; that's
+    /// more machinery than this fix warrants for what is, in practice, a
+    /// rare sequence (peek, then focus, then peek ends, then focus moves
+    /// away with no further dock interaction).
+    fn update_peeking_from_hover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let peeking = self.icon_hovered || self.overlay_hovered;
+        self.set_peeking(peeking, cx);
+        if peeking || self.pinned || !dock_position_supports_pinning(self.position) {
+            return;
+        }
+        let panel_focused = self
+            .active_panel_entry()
+            .map(|entry| entry.panel.panel_focus_handle(cx).contains_focused(window, cx))
+            .unwrap_or(false);
+        if !panel_focused {
+            self.set_open(false, window, cx);
+        }
     }
 
     fn resizable(&self, cx: &App) -> bool {
@@ -1448,7 +1510,13 @@ impl Render for Dock {
         };
 
         let overlay_height = window.viewport_size().height;
-        let overlay_width = panel.default_size(window, cx);
+        // Sized to the panel's stored width (if the user resized it while
+        // pinned), falling back to its default size -- same fallback
+        // pattern `render_dock`/`reserved_dock_width` use for the pinned
+        // case, so unpinning doesn't silently discard a chosen width.
+        let overlay_width = self
+            .stored_panel_size(panel.as_ref(), window, cx)
+            .unwrap_or_else(|| panel.default_size(window, cx));
         let anchor = match position {
             DockPosition::Left => Anchor::TopLeft,
             DockPosition::Right | DockPosition::Bottom => Anchor::TopRight,
@@ -1489,8 +1557,8 @@ impl Render for Dock {
                         // overlay with no gap, this hover-start and the icon's
                         // hover-end land in the same event dispatch, and
                         // whichever wrote `peeking` last would otherwise win.
-                        .on_hover(cx.listener(move |dock, hovered, _window, cx| {
-                            dock.set_overlay_hovered(*hovered, cx);
+                        .on_hover(cx.listener(move |dock, hovered, window, cx| {
+                            dock.set_overlay_hovered(*hovered, window, cx);
                         }))
                         .child(panel_content())
                         .children(pin_button),
@@ -1696,12 +1764,12 @@ impl Render for PanelButtons {
                                                 dock.activate_panel(panel_index, window, cx);
                                             }
                                             dock.set_open(true, window, cx);
-                                            dock.set_icon_hovered(true, cx);
+                                            dock.set_icon_hovered(true, window, cx);
                                         });
                                     } else {
                                         dock_for_hover.update(cx, |dock, cx| {
                                             if !dock.is_pinned() {
-                                                dock.set_icon_hovered(false, cx);
+                                                dock.set_icon_hovered(false, window, cx);
                                             }
                                         });
                                     }
