@@ -81,11 +81,26 @@ fn clamp_zoom(zoom: f32) -> f32 {
 }
 
 fn scaled_lane_width(base_lane_width: f32, zoom: f32) -> Pixels {
-    px((base_lane_width * clamp_zoom(zoom)).max(4.0))
+    // `MIN_LANE_WIDTH` alone isn't enough here: zoom can scale an
+    // already-floored `base_lane_width` back down below it (e.g. 4.0 * 0.5).
+    px((base_lane_width * clamp_zoom(zoom)).max(crate::git_graph_settings::MIN_LANE_WIDTH))
 }
 
 fn scaled_row_height(base: Pixels, extra: f32, zoom: f32) -> Pixels {
     (base + px(extra)) * clamp_zoom(zoom)
+}
+
+/// How far the graph canvas can be scrolled horizontally: the amount by
+/// which the content overflows the viewport, floored at zero (never
+/// negative, even when the content is narrower than the viewport).
+fn horizontal_scroll_range(content_width: Pixels, viewport_width: Pixels) -> Pixels {
+    (content_width - viewport_width).max(px(0.))
+}
+
+/// Clamps a horizontal scroll offset (a positive rightward distance) into
+/// `[0, horizontal_scroll_range(content_width, viewport_width)]`.
+fn clamp_horizontal_scroll(offset: Pixels, content_width: Pixels, viewport_width: Pixels) -> Pixels {
+    offset.clamp(px(0.), horizontal_scroll_range(content_width, viewport_width))
 }
 
 fn zoom_in_step(zoom: f32) -> f32 {
@@ -1285,8 +1300,13 @@ pub fn open_or_reuse_graph(
     workspace.add_item_to_active_pane(Box::new(git_graph), None, true, window, cx);
 }
 
-fn lane_center_x(bounds: Bounds<Pixels>, lane: f32, lane_width: Pixels) -> Pixels {
-    bounds.origin.x + LEFT_PADDING + lane * lane_width + lane_width / 2.0
+fn lane_center_x(
+    bounds: Bounds<Pixels>,
+    lane: f32,
+    lane_width: Pixels,
+    scroll_offset_x: Pixels,
+) -> Pixels {
+    bounds.origin.x + LEFT_PADDING + lane * lane_width + lane_width / 2.0 - scroll_offset_x
 }
 
 fn to_row_center(
@@ -1411,6 +1431,15 @@ pub struct GitGraph {
     _commit_diff_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     graph_width_override: Option<Pixels>,
+    /// Optimistic zoom value used as the base for the *next* zoom step,
+    /// mirroring `graph_width_override`. `set_zoom` persists asynchronously
+    /// (a disk round-trip via `update_settings_file`), so reading
+    /// `GitGraphSettings::get_global` directly as the step base would lose
+    /// steps under OS key-repeat: a second keystroke could read the same
+    /// stale global before the first write lands. Cleared once the
+    /// SettingsStore observer sees the persisted zoom catch up, so external
+    /// settings edits still take effect.
+    zoom_override: Option<f32>,
     repo_id: RepositoryId,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
@@ -1514,6 +1543,31 @@ impl GitGraph {
         });
     }
 
+    /// Base for the next zoom step: the optimistic in-memory value if one is
+    /// pending, otherwise the persisted setting. See `zoom_override`'s
+    /// doc comment for why the override is needed.
+    fn zoom_step_base(&self, cx: &App) -> f32 {
+        self.zoom_override
+            .unwrap_or_else(|| crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom)
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        let new_zoom = zoom_in_step(self.zoom_step_base(cx));
+        self.zoom_override = Some(new_zoom);
+        self.set_zoom(new_zoom, cx);
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        let new_zoom = zoom_out_step(self.zoom_step_base(cx));
+        self.zoom_override = Some(new_zoom);
+        self.set_zoom(new_zoom, cx);
+    }
+
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        self.zoom_override = Some(1.0);
+        self.set_zoom(1.0, cx);
+    }
+
     fn preview_column_fractions(&self, window: &Window, cx: &App) -> [f32; 5] {
         // todo(git_graph): We should make a column/table api that allows removing table columns
         let fractions = self
@@ -1555,13 +1609,6 @@ impl GitGraph {
         };
 
         ColumnWidthConfig::explicit(widths)
-    }
-
-    fn graph_viewport_width(&self, window: &Window, cx: &App) -> Pixels {
-        self.column_widths
-            .read(cx)
-            .preview_column_width(0, window)
-            .unwrap_or_else(|| self.graph_canvas_content_width(cx))
     }
 
     /// Decides which text columns are visible. In an editor tab all columns are
@@ -1701,6 +1748,16 @@ impl GitGraph {
                 row_height = new_row_height;
                 cx.notify();
             }
+
+            // Once the persisted zoom catches up with the last optimistic
+            // step we applied, defer to it again so external settings edits
+            // (e.g. hand-editing settings.json) still take effect.
+            if let Some(pending_zoom) = this.zoom_override {
+                let persisted_zoom = crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom;
+                if (persisted_zoom - pending_zoom).abs() < 1e-4 {
+                    this.zoom_override = None;
+                }
+            }
         })
         .detach();
 
@@ -1731,6 +1788,7 @@ impl GitGraph {
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             graph_width_override: None,
+            zoom_override: None,
             repo_id,
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
@@ -2292,7 +2350,6 @@ impl GitGraph {
                                 .w(graph_width)
                                 .h_full()
                                 .min_w_0()
-                                .overflow_x_scroll()
                                 .child(graph_canvas),
                         )
                         .child(self.render_graph_divider_handle(cx))
@@ -3643,12 +3700,11 @@ impl GitGraph {
         let first_visible_row = (scroll_offset_y / row_height).floor() as usize;
         let vertical_scroll_offset = scroll_offset_y - (first_visible_row as f32 * row_height);
 
-        let graph_viewport_width = self.graph_viewport_width(window, cx);
-        let graph_width = if self.graph_canvas_content_width(cx) > graph_viewport_width {
-            self.graph_canvas_content_width(cx)
-        } else {
-            graph_viewport_width
-        };
+        // The raw (unclamped) horizontal offset; clamping needs the real
+        // viewport width, which is only known once the canvas is laid out,
+        // so it's computed inside the paint closure below.
+        let raw_scroll_offset_x = table_state.scroll_offset().x;
+        let content_width = self.graph_canvas_content_width(cx);
         let last_visible_row = first_visible_row + visible_row_count + 1;
 
         let viewport_range = first_visible_row.min(loaded_commit_count.saturating_sub(1))
@@ -3677,6 +3733,9 @@ impl GitGraph {
             move |_bounds, _window, _cx| {},
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, cx: &mut App| {
                 graph_canvas_bounds.set(Some(bounds));
+
+                let scroll_offset_x =
+                    clamp_horizontal_scroll(-raw_scroll_offset_x, content_width, bounds.size.width);
 
                 window.paint_layer(bounds, |window| {
                     let accent_colors = cx.theme().accents();
@@ -3722,7 +3781,8 @@ impl GitGraph {
                             bounds.origin.y + row_idx as f32 * row_height + row_height / 2.0
                                 - vertical_scroll_offset;
 
-                        let commit_x = lane_center_x(bounds, row.lane as f32, lane_width);
+                        let commit_x =
+                            lane_center_x(bounds, row.lane as f32, lane_width, scroll_offset_x);
 
                         draw_commit_circle(commit_x, row_y_center, row_color, window);
                     }
@@ -3734,7 +3794,8 @@ impl GitGraph {
                             continue;
                         };
 
-                        let line_x = lane_center_x(bounds, start_column as f32, lane_width);
+                        let line_x =
+                            lane_center_x(bounds, start_column as f32, lane_width, scroll_offset_x);
 
                         let start_row = line.full_interval.start as i32 - first_visible_row as i32;
 
@@ -3779,8 +3840,12 @@ impl GitGraph {
                                     on_row,
                                     curve_kind,
                                 } => {
-                                    let mut to_column =
-                                        lane_center_x(bounds, *to_column as f32, lane_width);
+                                    let mut to_column = lane_center_x(
+                                        bounds,
+                                        *to_column as f32,
+                                        lane_width,
+                                        scroll_offset_x,
+                                    );
 
                                     let mut to_row = to_row_center(
                                         *on_row - first_visible_row,
@@ -3894,7 +3959,11 @@ impl GitGraph {
                 })
             },
         )
-        .w(graph_width)
+        // Stays exactly as wide as its container (never grows to fit
+        // `content_width`): the paint closure above scrolls by manually
+        // offsetting where lanes are drawn, and relies on `bounds.size.width`
+        // reflecting the true viewport so the scroll clamp is correct.
+        .w_full()
         .h_full()
     }
 
@@ -4026,7 +4095,21 @@ impl GitGraph {
         let max_vertical_scroll = (viewport_height - content_height).min(px(0.));
 
         let new_y = (current_offset.y + delta.y).clamp(max_vertical_scroll, px(0.));
-        let new_offset = Point::new(current_offset.x, new_y);
+
+        let content_width = self.graph_canvas_content_width(cx);
+        // The canvas's own bounds are the real graph viewport (distinct from
+        // the commits table's `viewport_height` reused above): the two areas
+        // have independent widths, so `table_state`'s handle can't tell us
+        // this one.
+        let viewport_width = self
+            .graph_canvas_bounds
+            .get()
+            .map(|bounds| bounds.size.width)
+            .unwrap_or(content_width);
+        let max_horizontal_scroll = horizontal_scroll_range(content_width, viewport_width);
+        let new_x = (current_offset.x + delta.x).clamp(-max_horizontal_scroll, px(0.));
+
+        let new_offset = Point::new(new_x, new_y);
 
         if new_offset != current_offset {
             table_state.set_scroll_offset(new_offset);
@@ -4346,15 +4429,13 @@ impl Render for GitGraph {
                 this.open_selected_commit_view(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
-                let current = crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom;
-                this.set_zoom(zoom_in_step(current), cx);
+                this.zoom_in(cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| {
-                let current = crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom;
-                this.set_zoom(zoom_out_step(current), cx);
+                this.zoom_out(cx);
             }))
             .on_action(cx.listener(|this, _: &ResetZoom, _window, cx| {
-                this.set_zoom(1.0, cx);
+                this.reset_zoom(cx);
             }))
             .on_action(cx.listener(Self::copy_selected_commit_sha))
             .on_action(cx.listener(Self::copy_selected_commit_tag))
@@ -5488,6 +5569,44 @@ mod tests {
         assert_eq!(zoom_out_step(0.5), 0.5); // clamps at min
     }
 
+    #[test]
+    fn test_clamp_horizontal_scroll() {
+        // Content narrower than (or equal to) the viewport: no scroll room,
+        // any requested offset clamps to zero.
+        assert_eq!(
+            clamp_horizontal_scroll(px(0.), px(100.0), px(200.0)),
+            px(0.)
+        );
+        assert_eq!(
+            clamp_horizontal_scroll(px(50.0), px(100.0), px(200.0)),
+            px(0.)
+        );
+        assert_eq!(
+            clamp_horizontal_scroll(px(50.0), px(200.0), px(200.0)),
+            px(0.)
+        );
+
+        // Content wider than the viewport: offsets clamp into [0, content - viewport].
+        assert_eq!(
+            clamp_horizontal_scroll(px(0.), px(300.0), px(200.0)),
+            px(0.)
+        );
+        assert_eq!(
+            clamp_horizontal_scroll(px(50.0), px(300.0), px(200.0)),
+            px(50.0)
+        );
+        assert_eq!(
+            clamp_horizontal_scroll(px(500.0), px(300.0), px(200.0)),
+            px(100.0) // clamped to max scroll (content - viewport)
+        );
+
+        // Never negative, even for a negative requested offset.
+        assert_eq!(
+            clamp_horizontal_scroll(px(-50.0), px(300.0), px(200.0)),
+            px(0.)
+        );
+    }
+
     #[gpui::test]
     fn test_graph_canvas_content_width_scales_and_uncaps(cx: &mut TestAppContext) {
         init_test(cx);
@@ -5582,6 +5701,87 @@ mod tests {
         let resolved =
             git_graph.read_with(&*cx, |graph, cx| graph.resolve_graph_area_width(cx));
         assert_eq!(resolved, px(28.0));
+    }
+
+    #[gpui::test]
+    async fn test_zoom_override_survives_key_repeat(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            serde_json::json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // Simulate OS key-repeat: two `ZoomIn` steps fire back-to-back,
+        // before the first `set_zoom` write round-trips through the (fake)
+        // filesystem and the global setting updates.
+        git_graph.update(cx, |graph, cx| {
+            graph.zoom_in(cx);
+            graph.zoom_in(cx);
+        });
+
+        let expected_zoom = zoom_in_step(zoom_in_step(1.0));
+
+        // Without `zoom_override`, the second step would have read the
+        // still-stale persisted zoom (1.0) as its base and landed on a
+        // single step instead of two.
+        let override_after_both_steps = git_graph.read_with(&*cx, |graph, _| graph.zoom_override);
+        assert!(
+            (override_after_both_steps.unwrap() - expected_zoom).abs() < 1e-6,
+            "optimistic zoom should reflect both compounded steps, got {override_after_both_steps:?}"
+        );
+
+        cx.run_until_parked();
+
+        // Once the writes land, the persisted zoom reflects both steps, and
+        // the SettingsStore observer clears the override so a later external
+        // settings edit would take effect again.
+        let persisted_zoom = git_graph.read_with(&*cx, |_graph, cx| {
+            crate::git_graph_settings::GitGraphSettings::get_global(cx).zoom
+        });
+        assert!(
+            (persisted_zoom - expected_zoom).abs() < 1e-4,
+            "persisted zoom should reflect both compounded steps, got {persisted_zoom}"
+        );
+
+        let override_after_settle = git_graph.read_with(&*cx, |graph, _| graph.zoom_override);
+        assert_eq!(
+            override_after_settle, None,
+            "override should be cleared once settings catch up"
+        );
     }
 
     #[test]

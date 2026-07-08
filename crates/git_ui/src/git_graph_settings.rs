@@ -1,7 +1,9 @@
 use settings::{RegisterSetting, Settings};
 
 const DEFAULT_LANE_WIDTH: f32 = 16.0;
-const MIN_LANE_WIDTH: f32 = 4.0;
+/// Floor for `lane_width`, shared with `scaled_lane_width`'s floor on the
+/// scaled result so the two can't drift apart.
+pub(crate) const MIN_LANE_WIDTH: f32 = 4.0;
 const DEFAULT_ROW_HEIGHT: f32 = 0.0;
 const DEFAULT_ZOOM: f32 = 1.0;
 
