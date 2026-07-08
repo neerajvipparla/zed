@@ -586,13 +586,28 @@ impl Dock {
             "Pin Panel Open"
         }
         .into();
-        IconButton::new("dock-pin-toggle", icon)
-            .icon_size(IconSize::Small)
-            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
-            .on_click(cx.listener(|dock, _event, _window, cx| {
-                let new_pinned = !dock.pinned;
-                dock.set_pinned(new_pinned, cx);
-            }))
+        // `IconButton` doesn't implement `Styled` itself (unlike a plain
+        // `div`), so positioning has to happen on a wrapping `div` -- the
+        // same pattern `create_resize_handle` below uses for overlay chrome
+        // pinned to a fixed spot. Both call sites (`render_docked`'s panel
+        // wrapper and the peek-overlay's panel wrapper) already establish a
+        // `.relative()` ancestor, so this `.absolute()` positions the button
+        // in the same top-right corner in both the docked and peeking
+        // states, per the design spec's "always in the same visual spot
+        // regardless of pin state" requirement.
+        div()
+            .absolute()
+            .top(px(4.))
+            .right(px(4.))
+            .child(
+                IconButton::new("dock-pin-toggle", icon)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+                    .on_click(cx.listener(|dock, _event, _window, cx| {
+                        let new_pinned = !dock.pinned;
+                        dock.set_pinned(new_pinned, cx);
+                    })),
+            )
             .into_any_element()
     }
 
@@ -1206,8 +1221,9 @@ impl Dock {
 impl Dock {
     /// The always-docked rendering used unconditionally for the Bottom dock
     /// and for pinned Left/Right docks. This is the pre-existing rendering
-    /// logic, unchanged, factored out so `Render for Dock` can share it
-    /// between the pinned and Bottom-dock code paths.
+    /// logic -- unchanged for Bottom, which never has a `pin_button` (always
+    /// `None`, see `Render for Dock` below) -- factored out so `Render for
+    /// Dock` can share it between the pinned and Bottom-dock code paths.
     fn render_docked(
         &mut self,
         position: DockPosition,
@@ -1331,24 +1347,24 @@ impl Render for Dock {
         };
 
         let position = self.position;
+        let supports_pinning = dock_position_supports_pinning(position);
         // Bottom dock is out of scope for collapsible/pin behavior -- always
         // render through the original always-docked path, with no pin
-        // button and no peek overlay. `dock_position_supports_pinning`
-        // returns `false` for Bottom, and `Dock::is_pinned()` (Task 1)
-        // already always reports `true` for Bottom regardless of the
-        // in-memory `pinned` field, so `pinned` below is `true` for Bottom
-        // even before the `||`. The explicit `dock_position_supports_pinning`
-        // check is what actually gates the pin button and peek-overlay
-        // branches further down -- see the warning there.
-        let pinned = self.pinned || !dock_position_supports_pinning(position);
+        // button and no peek overlay. `supports_pinning` is `false` for
+        // Bottom, and `Dock::is_pinned()` (Task 1) already always reports
+        // `true` for Bottom regardless of the in-memory `pinned` field, so
+        // `pinned` below is `true` for Bottom even before the `||`. The
+        // explicit `supports_pinning` check is what actually gates the pin
+        // button and peek-overlay branches further down -- see the warning
+        // there.
+        let pinned = self.pinned || !supports_pinning;
 
         // Only Left/Right docks ever show pin UI. `Dock::set_pinned` (Task 1)
         // already no-ops for Bottom, so this is UX rather than a
         // correctness guard on its own -- but it is also what prevents the
         // pin button from being constructed at all for Bottom, since
         // `render_pin_button` is only ever called from inside this `.then`.
-        let pin_button =
-            dock_position_supports_pinning(position).then(|| self.render_pin_button(pinned, cx));
+        let pin_button = supports_pinning.then(|| self.render_pin_button(pinned, cx));
 
         if pinned {
             return self
