@@ -13161,6 +13161,58 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_dock_peeking_is_ephemeral_toggle_state(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // `peeking` (Task 3) defaults to false and is unrelated to `pinned`
+        // (Task 1) -- it's in-memory-only state driven by hover, not
+        // persisted anywhere.
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.left_dock().read(cx).is_peeking());
+            assert!(!workspace.bottom_dock().read(cx).is_peeking());
+        });
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.set_peeking(true, cx));
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.left_dock().read(cx).is_peeking());
+            // Setting it on one dock doesn't affect others.
+            assert!(!workspace.right_dock().read(cx).is_peeking());
+        });
+
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .left_dock()
+                .update(cx, |dock, cx| dock.set_peeking(false, cx));
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.left_dock().read(cx).is_peeking());
+        });
+
+        // Setting `peeking` on the Bottom dock is harmless (Task 4 will
+        // never actually trigger this, since Bottom's status bar icons don't
+        // wire up hover-to-peek, but `set_peeking` itself has no
+        // Bottom-specific guard the way `set_pinned` does -- it's purely
+        // ephemeral UI state, not something that needs to be blocked at the
+        // API layer).
+        workspace.update_in(cx, |workspace, _window, cx| {
+            workspace
+                .bottom_dock()
+                .update(cx, |dock, cx| dock.set_peeking(true, cx));
+        });
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(workspace.bottom_dock().read(cx).is_peeking());
+        });
+    }
+
+    #[gpui::test]
     async fn test_close_panel_on_toggle(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());

@@ -8,10 +8,10 @@ use client::proto;
 use db::kvp::KeyValueStore;
 
 use gpui::{
-    Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Action, Anchor, AnyElement, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent,
+    ParentElement, Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window,
+    anchored, deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -278,6 +278,7 @@ pub struct Dock {
     zoom_layer_open: bool,
     modal_layer: Entity<ModalLayer>,
     pinned: bool,
+    peeking: bool,
     _subscriptions: [Subscription; 2],
 }
 
@@ -474,6 +475,7 @@ impl Dock {
                 zoom_layer_open: false,
                 modal_layer,
                 pinned: load_pinned_state(position, cx),
+                peeking: false,
             }
         });
 
@@ -549,8 +551,49 @@ impl Dock {
         cx.notify();
     }
 
+    /// Whether an unpinned dock is currently being shown as a hover-triggered
+    /// floating overlay. This is ephemeral, in-memory-only state -- it is
+    /// never persisted and always starts `false`.
+    pub fn is_peeking(&self) -> bool {
+        self.peeking
+    }
+
+    pub fn set_peeking(&mut self, peeking: bool, cx: &mut Context<Self>) {
+        if peeking == self.peeking {
+            return;
+        }
+        self.peeking = peeking;
+        cx.notify();
+    }
+
     fn resizable(&self, cx: &App) -> bool {
         !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
+    }
+
+    /// Renders the pin/unpin toggle shown as dock-level chrome. Callers must
+    /// only invoke this for positions where `dock_position_supports_pinning`
+    /// is true -- Bottom's `Dock` never shows this control (see the warning
+    /// in `Render for Dock` below for why that gating matters).
+    fn render_pin_button(&self, pinned: bool, cx: &mut Context<Self>) -> AnyElement {
+        let icon = if pinned {
+            IconName::Unpin
+        } else {
+            IconName::Pin
+        };
+        let tooltip_text: SharedString = if pinned {
+            "Unpin Panel"
+        } else {
+            "Pin Panel Open"
+        }
+        .into();
+        IconButton::new("dock-pin-toggle", icon)
+            .icon_size(IconSize::Small)
+            .tooltip(move |_window, cx| Tooltip::simple(tooltip_text.clone(), cx))
+            .on_click(cx.listener(|dock, _event, _window, cx| {
+                let new_pinned = !dock.pinned;
+                dock.set_pinned(new_pinned, cx);
+            }))
+            .into_any_element()
     }
 
     pub fn panel<T: Panel>(&self) -> Option<Entity<T>> {
@@ -1160,112 +1203,238 @@ impl Dock {
     }
 }
 
-impl Render for Dock {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dispatch_context = Self::dispatch_context();
-        if let Some(entry) = self.visible_entry() {
-            let position = self.position;
-            let create_resize_handle = || {
-                let handle = div()
-                    .id("resize-handle")
-                    .on_drag(DraggedDock(position), |dock, _, _, cx| {
+impl Dock {
+    /// The always-docked rendering used unconditionally for the Bottom dock
+    /// and for pinned Left/Right docks. This is the pre-existing rendering
+    /// logic, unchanged, factored out so `Render for Dock` can share it
+    /// between the pinned and Bottom-dock code paths.
+    fn render_docked(
+        &mut self,
+        position: DockPosition,
+        dispatch_context: KeyContext,
+        panel: &Arc<dyn PanelHandle>,
+        pin_button: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let create_resize_handle = || {
+            let handle = div()
+                .id("resize-handle")
+                .on_drag(DraggedDock(position), |dock, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| dock.clone())
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
-                        cx.new(|_| dock.clone())
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|dock, e: &MouseUpEvent, window, cx| {
+                        if e.click_count == 2 {
+                            dock.resize_active_panel(None, None, window, cx);
+                            dock.workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.serialize_workspace(window, cx);
+                                })
+                                .ok();
                             cx.stop_propagation();
-                        }),
-                    )
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|dock, e: &MouseUpEvent, window, cx| {
-                            if e.click_count == 2 {
-                                dock.resize_active_panel(None, None, window, cx);
-                                dock.workspace
-                                    .update(cx, |workspace, cx| {
-                                        workspace.serialize_workspace(window, cx);
-                                    })
-                                    .ok();
-                                cx.stop_propagation();
-                            }
-                        }),
-                    )
-                    .occlude();
-                match self.position() {
-                    DockPosition::Left => deferred(
-                        handle
-                            .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
-                            .top(px(0.))
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
-                    DockPosition::Bottom => deferred(
-                        handle
-                            .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
-                            .left(px(0.))
-                            .w_full()
-                            .h(RESIZE_HANDLE_SIZE)
-                            .cursor_row_resize(),
-                    ),
-                    DockPosition::Right => deferred(
-                        handle
-                            .absolute()
-                            .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
-                            .h_full()
-                            .w(RESIZE_HANDLE_SIZE)
-                            .cursor_col_resize(),
-                    ),
-                }
-            };
+                        }
+                    }),
+                )
+                .occlude();
+            match position {
+                DockPosition::Left => deferred(
+                    handle
+                        .absolute()
+                        .right(-RESIZE_HANDLE_SIZE / 2.)
+                        .top(px(0.))
+                        .h_full()
+                        .w(RESIZE_HANDLE_SIZE)
+                        .cursor_col_resize(),
+                ),
+                DockPosition::Bottom => deferred(
+                    handle
+                        .absolute()
+                        .top(-RESIZE_HANDLE_SIZE / 2.)
+                        .left(px(0.))
+                        .w_full()
+                        .h(RESIZE_HANDLE_SIZE)
+                        .cursor_row_resize(),
+                ),
+                DockPosition::Right => deferred(
+                    handle
+                        .absolute()
+                        .top(px(0.))
+                        .left(-RESIZE_HANDLE_SIZE / 2.)
+                        .h_full()
+                        .w(RESIZE_HANDLE_SIZE)
+                        .cursor_col_resize(),
+                ),
+            }
+        };
 
-            div()
+        div()
+            .id("dock-panel")
+            .key_context(dispatch_context)
+            .track_focus(&self.focus_handle(cx))
+            .focus_follows_mouse(self.focus_follows_mouse, cx)
+            .flex()
+            .bg(cx.theme().colors().panel_background)
+            .border_color(cx.theme().colors().border)
+            .overflow_hidden()
+            .map(|this| match position.axis() {
+                // Width and height are always set on the workspace wrapper in
+                // render_dock, so fill whatever space the wrapper provides.
+                Axis::Horizontal => this.w_full().h_full().flex_row(),
+                Axis::Vertical => this.h_full().w_full().flex_col(),
+            })
+            .map(|this| match position {
+                DockPosition::Left => this.border_r_1(),
+                DockPosition::Right => this.border_l_1(),
+                DockPosition::Bottom => this.border_t_1(),
+            })
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .child(
+                        div()
+                            .map(|this| match position.axis() {
+                                Axis::Horizontal => this.w_full().h_full(),
+                                Axis::Vertical => this.h_full().w_full(),
+                            })
+                            .child(
+                                panel
+                                    .to_any()
+                                    .cached(StyleRefinement::default().v_flex().size_full()),
+                            ),
+                    )
+                    .children(pin_button),
+            )
+            .when(self.resizable(cx), |this| {
+                this.child(create_resize_handle())
+            })
+    }
+}
+
+impl Render for Dock {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dispatch_context = Self::dispatch_context();
+        let Some(panel) = self.visible_entry().map(|entry| entry.panel.clone()) else {
+            return div()
                 .id("dock-panel")
                 .key_context(dispatch_context)
                 .track_focus(&self.focus_handle(cx))
-                .focus_follows_mouse(self.focus_follows_mouse, cx)
-                .flex()
-                .bg(cx.theme().colors().panel_background)
-                .border_color(cx.theme().colors().border)
-                .overflow_hidden()
-                .map(|this| match self.position().axis() {
-                    // Width and height are always set on the workspace wrapper in
-                    // render_dock, so fill whatever space the wrapper provides.
-                    Axis::Horizontal => this.w_full().h_full().flex_row(),
-                    Axis::Vertical => this.h_full().w_full().flex_col(),
-                })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
+                .into_any_element();
+        };
+
+        let position = self.position;
+        // Bottom dock is out of scope for collapsible/pin behavior -- always
+        // render through the original always-docked path, with no pin
+        // button and no peek overlay. `dock_position_supports_pinning`
+        // returns `false` for Bottom, and `Dock::is_pinned()` (Task 1)
+        // already always reports `true` for Bottom regardless of the
+        // in-memory `pinned` field, so `pinned` below is `true` for Bottom
+        // even before the `||`. The explicit `dock_position_supports_pinning`
+        // check is what actually gates the pin button and peek-overlay
+        // branches further down -- see the warning there.
+        let pinned = self.pinned || !dock_position_supports_pinning(position);
+
+        // Only Left/Right docks ever show pin UI. `Dock::set_pinned` (Task 1)
+        // already no-ops for Bottom, so this is UX rather than a
+        // correctness guard on its own -- but it is also what prevents the
+        // pin button from being constructed at all for Bottom, since
+        // `render_pin_button` is only ever called from inside this `.then`.
+        let pin_button =
+            dock_position_supports_pinning(position).then(|| self.render_pin_button(pinned, cx));
+
+        if pinned {
+            return self
+                .render_docked(position, dispatch_context, &panel, pin_button, cx)
+                .into_any_element();
+        }
+
+        // Unpinned: reserve no layout space here (Task 2 already made
+        // render_dock skip width reservation). Only paint anything while
+        // peeking -- or while the panel already holds focus, e.g. via
+        // `toggle_panel_focus`/keyboard actions that bypass hover entirely.
+        //
+        // This focus check matters beyond just "should the user be able to
+        // see what they focused": Workspace registers an `on_focus_lost`
+        // handler (`workspace.rs`, near `cx.on_focus(&focus_handle, ...)`)
+        // that reclaims focus for the workspace root whenever the window's
+        // focus path goes empty on a redraw. If we returned a bare
+        // `track_focus`-only div here whenever `!self.peeking`, focusing the
+        // panel directly (as `toggle_panel_focus` does, bypassing the dock's
+        // own focus handle) would desync from the very next render: the
+        // panel's `FocusHandle` would no longer be mounted anywhere in the
+        // tree, `focus_path()` would go empty, and `on_focus_lost` would
+        // silently steal focus back to the workspace on the next redraw --
+        // even though nothing the user did asked for that. Keeping the panel
+        // mounted (via the overlay) whenever it holds focus avoids that.
+        let panel_focused = panel.panel_focus_handle(cx).contains_focused(window, cx);
+        if !self.peeking && !panel_focused {
+            return div()
+                .id("dock-panel")
+                .key_context(dispatch_context)
+                .track_focus(&self.focus_handle(cx))
+                .into_any_element();
+        }
+
+        let panel_content = || {
+            div()
+                .map(|this| match position.axis() {
+                    Axis::Horizontal => this.w_full().h_full(),
+                    Axis::Vertical => this.h_full().w_full(),
                 })
                 .child(
-                    div()
-                        .map(|this| match self.position().axis() {
-                            Axis::Horizontal => this.w_full().h_full(),
-                            Axis::Vertical => this.h_full().w_full(),
-                        })
-                        .child(
-                            entry
-                                .panel
-                                .to_any()
-                                .cached(StyleRefinement::default().v_flex().size_full()),
-                        ),
+                    panel
+                        .to_any()
+                        .cached(StyleRefinement::default().v_flex().size_full()),
                 )
-                .when(self.resizable(cx), |this| {
-                    this.child(create_resize_handle())
-                })
-        } else {
-            div()
-                .id("dock-panel")
-                .key_context(dispatch_context)
-                .track_focus(&self.focus_handle(cx))
-        }
+        };
+
+        let overlay_height = window.viewport_size().height;
+        let overlay_width = panel.default_size(window, cx);
+        let anchor = match position {
+            DockPosition::Left => Anchor::TopLeft,
+            DockPosition::Right | DockPosition::Bottom => Anchor::TopRight,
+        };
+
+        div()
+            .id("dock-panel")
+            .key_context(dispatch_context)
+            .track_focus(&self.focus_handle(cx))
+            .child(deferred(
+                anchored().anchor(anchor).child(
+                    div()
+                        .id("dock-peek-overlay")
+                        .occlude()
+                        .relative()
+                        .w(overlay_width)
+                        .h(overlay_height)
+                        .flex()
+                        .bg(cx.theme().colors().panel_background)
+                        .border_color(cx.theme().colors().border)
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .map(|this| match position {
+                            DockPosition::Left => this.border_r_1(),
+                            DockPosition::Right => this.border_l_1(),
+                            DockPosition::Bottom => this.border_t_1(),
+                        })
+                        .on_hover(cx.listener(move |dock, hovered, _window, cx| {
+                            if !hovered {
+                                dock.set_peeking(false, cx);
+                            }
+                        }))
+                        .child(panel_content())
+                        .children(pin_button),
+                ),
+            ))
+            .into_any_element()
     }
 }
 
